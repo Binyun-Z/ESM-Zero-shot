@@ -8,6 +8,9 @@ import re
 import os
 import shutil
 from transformers import EsmForMaskedLM, EsmTokenizer, EsmConfig
+import argparse
+import accelerate
+from accelerate import Accelerator
 class Mutation_Set(Dataset):
     def __init__(self, data, tokenizer, sep_len=1024):
         self.data = data
@@ -87,7 +90,6 @@ def get_wt(seq, mut):
     for i, p in enumerate(pos):
         seq[p - 1] = chars[i]  # 替换为原始字符
     return ''.join(seq)
-
 def compute_score(model, seq, mask, wt, pos, tokenizer):
     '''
     compute mutational proxy using masked marginal probability
@@ -99,12 +101,13 @@ def compute_score(model, seq, mask, wt, pos, tokenizer):
         score: mutational proxy score
         logits: output logits for masked sequence
     '''
-    seq = seq.to('cuda') 
-    mask = mask.to('cuda') 
-    wt = wt.to('cuda') 
-    model = model.to('cuda')
-    device = seq.device
-    model.eval()
+
+    # device = seq.device
+
+    # seq = seq.to(device) 
+    # mask = mask.to(device) 
+    # wt = wt.to(device) 
+    # model = model.to(device)
 
     mask_seq = seq.clone()
     m_id = tokenizer.mask_token_id
@@ -118,7 +121,7 @@ def compute_score(model, seq, mask, wt, pos, tokenizer):
     logits = out.logits
     log_probs = torch.log_softmax(logits, dim=-1)
     scores = torch.zeros(batch_size)
-    scores = scores.to(device)
+    # scores = scores.to(device)
 
     for i in range(batch_size):
 
@@ -130,10 +133,68 @@ def compute_score(model, seq, mask, wt, pos, tokenizer):
 
     return scores, logits
 
+def evaluate(model, testloader, tokenizer, accelerator, istest=True):
+    model.eval()
+    seq_list = []
+    score_list = []
+    gscore_list = []
+    with torch.no_grad():
+        for step, data in enumerate(testloader):
+            seq, mask = data[0], data[1]
+            wt, wt_mask = data[2], data[3]
+            pos = data[4]
+            golden_score = data[5]
+            pid = data[6]
+            if istest:
+                pid = pid.cuda()
+                pid = accelerator.gather(pid)
+                for s in pid:
+                    seq_list.append(s.cpu())
+
+            score, logits = compute_score(model, seq, mask, wt, pos, tokenizer)
+
+            score = score.cuda()
+            score = accelerator.gather(score)
+            golden_score = accelerator.gather(golden_score)
+            score = np.asarray(score.cpu())
+            golden_score = np.asarray(golden_score.cpu())
+            score_list.extend(score)
+            gscore_list.extend(golden_score)
+    score_list = np.asarray(score_list)
+    gscore_list = np.asarray(gscore_list)
+    sr = spearman(score_list, gscore_list)
+
+    if istest:
+        seq_list = np.asarray(seq_list)
+
+        return sr, score_list, seq_list
+    else:
+        return sr
+
+
+def get_dataloader(data_path,csv_file,tokenizer,batch_size):
+    df = pd.read_csv(os.path.join(data_path,csv_file))
+    df['mut_pos'] = df.apply(get_pos,axis = 1)
+    wt_seq = get_wt(df['mutated_sequence'][0],df['mutant'][0])
+    df['target_seq'] = wt_seq
+    df['PID'] = df.index
+    df = df[df['mut_pos']<1023]
+    dfset = Mutation_Set(data=df,tokenizer=tokenizer)
+    dfloader = DataLoader(dfset, batch_size=batch_size, collate_fn=dfset.collate_fn, shuffle=True)
+    return dfloader
+
 if __name__ == '__main__':
-    basemodel = EsmForMaskedLM.from_pretrained('facebook/esm2_t48_15B_UR50D')
-    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t48_15B_UR50D')
+
+
+    batch_size = 1
+    accelerator = Accelerator()
+    # basemodel = EsmForMaskedLM.from_pretrained('facebook/esm2_t33_650M_UR50D')
+    # tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t33_650M_UR50D')facebook/esm2_t36_3B_UR50D
+    basemodel = EsmForMaskedLM.from_pretrained('facebook/esm2_t36_3B_UR50D')
+    tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t36_3B_UR50D')
     data_path = './substitutions_singles'
+
+    basemodel = accelerator.prepare(basemodel)
 
     # file_list = [file for  file in  os.listdir(data_path) if file.endswith('.csv')]
 
@@ -149,41 +210,16 @@ if __name__ == '__main__':
     ]
     sr_list = []
     for csv_file in file_list:
-        df = pd.read_csv(os.path.join(data_path,csv_file))
-        df['mut_pos'] = df.apply(get_pos,axis = 1)
-        wt_seq = get_wt(df['mutated_sequence'][0],df['mutant'][0])
-        df['target_seq'] = wt_seq
-        df['PID'] = df.index
-        df = df[df['mut_pos']<1023]
-        dfset = Mutation_Set(data=df,tokenizer=tokenizer)
 
-        dfloader = DataLoader(dfset, batch_size=1, collate_fn=dfset.collate_fn, shuffle=True,num_workers=96)
+        with accelerator.main_process_first():
+            dfloader = get_dataloader(data_path,csv_file,tokenizer,batch_size)
 
-        basemodel.eval()
-        seq_list = []
-        score_list = []
-        gscore_list = []
-        with torch.no_grad():
-            for step, data in enumerate(dfloader):
-                seq, mask = data[0], data[1]
-                wt, wt_mask = data[2], data[3]
-                pos = data[4]
-                golden_score = data[5]
-                pid = data[6]
+        dfloader = accelerator.prepare(dfloader)
+        sr, score, pid = evaluate(basemodel, dfloader, tokenizer, accelerator, istest=True)
 
-                score, logits = compute_score(basemodel, seq, mask, wt, pos, tokenizer)
-
-                score = score.cuda()
-
-
-                score = np.asarray(score.cpu())
-                golden_score = np.asarray(golden_score.cpu())
-                score_list.extend(score)
-                gscore_list.extend(golden_score)
-        score_list = np.asarray(score_list)
-        gscore_list = np.asarray(gscore_list)
-        sr = spearman(score_list, gscore_list)
         sr_list.append(sr)
-        print(f'dataset------------{csv_file}-----------------spearman-------{sr}')
-    pd.DataFrame({'dataset':file_list,'spearman':sr_list}).to_csv('./selected_data_esm2_spearman.csv',index = False)
+        accelerator.print(f'dataset------------{csv_file}-----------------spearman-------{sr}')
+    if accelerator.is_main_process:
+        pd.DataFrame({'dataset':file_list,'spearman':sr_list}).to_csv('./selected_data_esm2_3B(2)_spearman.csv',index = False)
+
 
